@@ -97,6 +97,18 @@ pub struct NowPlaying {
     pub position_secs: u64,
     pub length_secs: Option<u64>,
     pub playing: bool,
+    /// Media volume 0.0–1.0 when the player exposes it (MPRIS `Volume`); `None` otherwise — never guessed.
+    pub volume: Option<f32>,
+}
+
+/// Coarse machine load for the island. Sampled by the host from local sources
+/// (procfs on Linux); never leaves the device.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SystemStats {
+    pub cpu_percent: f32,
+    pub ram_percent: f32,
+    pub ram_used_mb: u64,
+    pub ram_total_mb: u64,
 }
 
 /// One in-flight or finished download/transfer shown on the island.
@@ -135,6 +147,8 @@ pub struct IslandSnapshot {
     pub downloads: Vec<DownloadTask>,
     pub downloads_active: usize,
     pub dropped_files: Vec<DroppedFile>,
+    /// Coarse local CPU/RAM load; `None` when the sampler is off or unsupported on this platform.
+    pub system: Option<SystemStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +161,7 @@ pub struct IslandManager {
     now_playing: Option<NowPlaying>,
     downloads: Vec<DownloadTask>,
     dropped_files: Vec<DroppedFile>,
+    system: Option<SystemStats>,
 }
 
 impl Default for IslandManager {
@@ -166,6 +181,7 @@ impl IslandManager {
             now_playing: None,
             downloads: Vec::new(),
             dropped_files: Vec::new(),
+            system: None,
         }
     }
 
@@ -363,6 +379,11 @@ impl IslandManager {
         self.now_playing = now_playing;
     }
 
+    /// Host pushes (or clears with `None`) the coarse local system load sample.
+    pub fn set_system(&mut self, system: Option<SystemStats>) {
+        self.system = system;
+    }
+
     /// Insert or update one in-flight/finished download. Label is trimmed to 80 chars.
     /// When the in-flight table is full, the oldest *done* entry is evicted; if none
     /// are done, the task is refused rather than evicting a live transfer.
@@ -440,6 +461,7 @@ impl IslandManager {
             downloads: self.downloads.clone(),
             downloads_active: self.downloads.iter().filter(|d| !d.done).count(),
             dropped_files: self.dropped_files.clone(),
+            system: self.system,
         }
     }
 }
@@ -635,6 +657,7 @@ mod tests {
             position_secs: 12,
             length_secs: Some(232),
             playing: true,
+            volume: None,
         }));
         assert_eq!(m.snapshot().now_playing.as_ref().unwrap().title, "A Change Is Gonna Come");
         m.set_now_playing(None);
