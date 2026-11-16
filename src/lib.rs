@@ -131,6 +131,46 @@ impl IslandManager {
         Ok(self.push_content(IslandContent::Toast { text }, priority, now_ms, Some(6_000)))
     }
 
+    /// Push a clipboard-stored notification (priority Normal, auto-dismiss 6s).
+    /// The preview is validated like a toast (1..=MAX_TOAST_CHARS). Returns the id.
+    pub fn notify_clipboard(&mut self, preview: String, at_ms: u64) -> Result<u64, IslandError> {
+        Ok(self.push_clipboard_helper(preview, Priority::Normal, at_ms)?.id)
+    }
+
+    /// Push a file-transfer progress notification (priority Normal, auto-dismiss 6s).
+    /// The label is validated like a toast (1..=MAX_TOAST_CHARS). Returns the id.
+    pub fn notify_file_transfer(
+        &mut self,
+        label: String,
+        bytes_done: u64,
+        bytes_total: u64,
+        at_ms: u64,
+    ) -> Result<u64, IslandError> {
+        let chars = label.chars().count();
+        if chars == 0 || chars > MAX_TOAST_CHARS {
+            return Err(IslandError::BadToastLength(chars));
+        }
+        Ok(self.push_content(IslandContent::FileTransfer { label, bytes_done, bytes_total }, Priority::Normal, at_ms, Some(6_000)).id)
+    }
+
+    /// Shared push path for clipboard notifications (kept private; clipboard previews
+    /// carry no user-typed text, only an opaque preview the host computed).
+    fn push_clipboard_helper(&mut self, preview: String, priority: Priority, now_ms: u64) -> Result<IslandNotification, IslandError> {
+        let chars = preview.chars().count();
+        if chars == 0 || chars > MAX_TOAST_CHARS {
+            return Err(IslandError::BadToastLength(chars));
+        }
+        Ok(self.push_content(IslandContent::ClipboardStored { preview }, priority, now_ms, Some(6_000)))
+    }
+
+    /// Dismiss the currently active notification. Returns the number dismissed (0 or 1) —
+    /// i.e. it behaves like [`Self::dismiss_active`] and reports whether anything popped.
+    pub fn drain_queued(&mut self) -> usize {
+        let had_active = self.active.is_some() as usize;
+        self.dismiss_active();
+        had_active
+    }
+
     pub fn push_content(
         &mut self,
         content: IslandContent,
@@ -396,6 +436,53 @@ mod tests {
         let mut m = IslandManager::new();
         assert_eq!(m.start_timer("x", 500, 0).unwrap_err(), IslandError::BadTimerDuration);
         assert_eq!(m.start_timer("x", 9 * 3_600_000, 0).unwrap_err(), IslandError::BadTimerDuration);
+    }
+
+    #[test]
+    fn notify_clipboard_pushes_normal_auto_dismiss() {
+        let mut m = IslandManager::new();
+        let id = m.notify_clipboard("cargo test --locked".to_string(), 100).unwrap();
+        let snap = m.snapshot();
+        let active = snap.active.as_ref().expect("clipboard notification should be active");
+        assert_eq!(active.id, id);
+        assert_eq!(active.priority, Priority::Normal);
+        assert_eq!(active.auto_dismiss_ms, Some(6_000));
+        assert!(matches!(&active.content, IslandContent::ClipboardStored { preview } if preview == "cargo test --locked"));
+        // Validation: empty / too-long previews are rejected
+        assert!(matches!(m.notify_clipboard(String::new(), 200), Err(IslandError::BadToastLength(0))));
+        assert!(matches!(m.notify_clipboard("x".repeat(141), 200), Err(IslandError::BadToastLength(141))));
+        assert_eq!(m.snapshot().queued, 0); // only the valid one remains queued/active
+    }
+
+    #[test]
+    fn notify_file_transfer_pushes_progress_payload() {
+        let mut m = IslandManager::new();
+        let id = m.notify_file_transfer("iso.img".to_string(), 512, 1024, 300).unwrap();
+        let snap = m.snapshot();
+        let active = snap.active.as_ref().expect("transfer notification should be active");
+        assert_eq!(active.id, id);
+        assert_eq!(active.priority, Priority::Normal);
+        assert!(matches!(
+            &active.content,
+            IslandContent::FileTransfer { label, bytes_done, bytes_total }
+                if label == "iso.img" && *bytes_done == 512 && *bytes_total == 1024
+        ));
+        assert!(matches!(m.notify_file_transfer(String::new(), 0, 10, 400), Err(IslandError::BadToastLength(0))));
+        assert!(matches!(m.notify_file_transfer("y".repeat(141), 0, 10, 400), Err(IslandError::BadToastLength(141))));
+    }
+
+    #[test]
+    fn drain_queued_pops_active_and_counts() {
+        let mut m = IslandManager::new();
+        assert_eq!(m.drain_queued(), 0); // nothing active → 0 dismissed
+        m.notify_clipboard("first".into(), 0).unwrap();
+        m.notify_file_transfer("second".into(), 1, 2, 10).unwrap(); // queued behind first
+        assert_eq!(m.drain_queued(), 1); // pops active ("first"); promotes next
+        assert_eq!(m.snapshot().queued, 0);
+        assert!(matches!(m.snapshot().active.as_ref().map(|n| &n.content), Some(IslandContent::FileTransfer { .. })));
+        assert_eq!(m.drain_queued(), 1); // pops the promoted transfer
+        assert_eq!(m.snapshot().active.as_ref(), None);
+        assert_eq!(m.drain_queued(), 0);
     }
 
     #[test]
