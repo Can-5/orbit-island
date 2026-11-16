@@ -87,12 +87,54 @@ pub enum IslandView {
     Expanded,
 }
 
+/// Currently-playing media reported by the host (e.g. MPRIS over D-Bus on KDE/Linux).
+/// The island never invents it; the host pushes and clears it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NowPlaying {
+    pub player: String,
+    pub title: String,
+    pub artist: String,
+    pub position_secs: u64,
+    pub length_secs: Option<u64>,
+    pub playing: bool,
+}
+
+/// One in-flight or finished download/transfer shown on the island.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DownloadTask {
+    /// Stable host-chosen key.
+    pub id: String,
+    pub label: String,
+    pub received_bytes: u64,
+    /// `None` when the total is unknowable — never guessed.
+    pub total_bytes: Option<u64>,
+    pub done: bool,
+}
+
+/// A file the user dropped onto the island. Listing only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroppedFile {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// How many completed download tasks to keep for the "recent" list.
+pub const MAX_KEEP_DONE_DOWNLOADS: usize = 4;
+/// Upper bound on tracked in-flight downloads.
+pub const MAX_TRACK_DOWNLOADS: usize = 8;
+/// Upper bound on remembered dropped files.
+pub const MAX_DROPPED_FILES: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IslandSnapshot {
     pub active: Option<IslandNotification>,
     pub queued: usize,
     pub view: IslandView,
     pub timer: Option<FocusTimer>,
+    pub now_playing: Option<NowPlaying>,
+    pub downloads: Vec<DownloadTask>,
+    pub downloads_active: usize,
+    pub dropped_files: Vec<DroppedFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +144,9 @@ pub struct IslandManager {
     next_id: u64,
     view: IslandView,
     timer: Option<FocusTimer>,
+    now_playing: Option<NowPlaying>,
+    downloads: Vec<DownloadTask>,
+    dropped_files: Vec<DroppedFile>,
 }
 
 impl Default for IslandManager {
@@ -118,6 +163,9 @@ impl IslandManager {
             next_id: 1,
             view: IslandView::Collapsed,
             timer: None,
+            now_playing: None,
+            downloads: Vec::new(),
+            dropped_files: Vec::new(),
         }
     }
 
@@ -310,12 +358,88 @@ impl IslandManager {
         self.view = if expanded { IslandView::Expanded } else { IslandView::Collapsed };
     }
 
+    /// Host pushes (or clears with `None`) the currently-playing media item.
+    pub fn set_now_playing(&mut self, now_playing: Option<NowPlaying>) {
+        self.now_playing = now_playing;
+    }
+
+    /// Insert or update one in-flight/finished download. Label is trimmed to 80 chars.
+    /// When the in-flight table is full, the oldest *done* entry is evicted; if none
+    /// are done, the task is refused rather than evicting a live transfer.
+    pub fn upsert_download(&mut self, task: DownloadTask) {
+        let label = task.label.trim();
+        if label.is_empty() {
+            return;
+        }
+        let clamped_label: String = label.chars().take(80).collect();
+        let mut task = task;
+        task.label = clamped_label;
+        if let Some(slot) = self.downloads.iter_mut().find(|d| d.id == task.id) {
+            *slot = task;
+            return;
+        }
+        let inflight = self.downloads.iter().filter(|d| !d.done).count();
+        if inflight >= MAX_TRACK_DOWNLOADS {
+            match self.downloads.iter().position(|d| d.done) {
+                Some(pos) => {
+                    self.downloads.remove(pos);
+                }
+                None => return, // refuse rather than evict a live transfer
+            }
+        }
+        self.downloads.push(task);
+        self.trim_downloads();
+    }
+
+    pub fn mark_download_done(&mut self, id: &str) {
+        if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+            d.done = true;
+        }
+        self.trim_downloads();
+    }
+
+    pub fn remove_download(&mut self, id: &str) {
+        self.downloads.retain(|d| d.id != id);
+    }
+
+    fn trim_downloads(&mut self) {
+        let mut done_kept = 0;
+        self.downloads.retain(|d| {
+            if d.done {
+                done_kept += 1;
+                done_kept <= MAX_KEEP_DONE_DOWNLOADS
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Remember a file dropped on the island (listing only, nothing is copied/moved).
+    pub fn add_dropped_file(&mut self, file: DroppedFile) {
+        if file.path.trim().is_empty() {
+            return;
+        }
+        self.dropped_files.push(file);
+        if self.dropped_files.len() > MAX_DROPPED_FILES {
+            let excess = self.dropped_files.len() - MAX_DROPPED_FILES;
+            self.dropped_files.drain(0..excess);
+        }
+    }
+
+    pub fn clear_dropped_files(&mut self) {
+        self.dropped_files.clear();
+    }
+
     pub fn snapshot(&self) -> IslandSnapshot {
         IslandSnapshot {
             active: self.active.clone(),
             queued: self.queue.len(),
             view: self.view,
             timer: self.timer.clone(),
+            now_playing: self.now_playing.clone(),
+            downloads: self.downloads.clone(),
+            downloads_active: self.downloads.iter().filter(|d| !d.done).count(),
+            dropped_files: self.dropped_files.clone(),
         }
     }
 }
@@ -497,5 +621,62 @@ mod tests {
         let json = serde_json::to_string(&evt).unwrap();
         assert!(json.contains("\"kind\":\"event\""));
         assert!(!json.contains("\"id\"") || !json.contains("\"id\":"));
+    }
+
+    #[test]
+    fn ambient_now_playing_downloads_and_drops() {
+        let mut m = IslandManager::new();
+        assert!(m.snapshot().now_playing.is_none());
+
+        m.set_now_playing(Some(NowPlaying {
+            player: "spotify_client".into(),
+            title: "A Change Is Gonna Come".into(),
+            artist: "Sam Cooke".into(),
+            position_secs: 12,
+            length_secs: Some(232),
+            playing: true,
+        }));
+        assert_eq!(m.snapshot().now_playing.as_ref().unwrap().title, "A Change Is Gonna Come");
+        m.set_now_playing(None);
+
+        m.upsert_download(DownloadTask {
+            id: "dl-1".into(),
+            label: "fedora.iso".into(),
+            received_bytes: 10,
+            total_bytes: Some(100),
+            done: false,
+        });
+        assert_eq!(m.snapshot().downloads_active, 1);
+        m.mark_download_done("dl-1");
+        assert_eq!(m.snapshot().downloads_active, 0);
+        assert_eq!(m.snapshot().downloads.len(), 1);
+
+        m.add_dropped_file(DroppedFile { path: "/tmp/x.png".into(), bytes: 5 });
+        m.add_dropped_file(DroppedFile { path: "".into(), bytes: 5 });
+        assert_eq!(m.snapshot().dropped_files.len(), 1);
+        m.clear_dropped_files();
+        assert!(m.snapshot().dropped_files.is_empty());
+    }
+
+    #[test]
+    fn downloads_refuse_nine_in_flight() {
+        let mut m = IslandManager::new();
+        for i in 0..MAX_TRACK_DOWNLOADS {
+            m.upsert_download(DownloadTask {
+                id: format!("live-{i}"),
+                label: format!("live-{i}.bin"),
+                received_bytes: 0,
+                total_bytes: None,
+                done: false,
+            });
+        }
+        m.upsert_download(DownloadTask {
+            id: "live-overflow".into(),
+            label: "overflow.bin".into(),
+            received_bytes: 0,
+            total_bytes: None,
+            done: false,
+        });
+        assert!(m.snapshot().downloads.iter().all(|d| d.id != "live-overflow"));
     }
 }
